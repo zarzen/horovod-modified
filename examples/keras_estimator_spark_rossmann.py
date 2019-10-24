@@ -15,30 +15,25 @@
 # ==============================================================================
 
 import datetime
-import h5py
-import io
 import os
-import pyarrow as pa
+
 from pyspark import SparkConf, Row
 from pyspark.sql import SparkSession
+
 import pyspark.sql.types as T
 import pyspark.sql.functions as F
 
 # Location of data on local filesystem (prefixed with file://) or on HDFS.
 DATA_LOCATION = 'file://' + os.getcwd()
 
-# Location of outputs on local filesystem (without file:// prefix).
+# Location of outputs.
 LOCAL_SUBMISSION_CSV = 'submission.csv'
-LOCAL_CHECKPOINT_FILE = 'checkpoint.h5'
+LOCAL_CHECKPOINT_FILE = os.path.join(DATA_LOCATION, 'checkpoint')
 
-# Spark clusters to use for training. If set to None, uses current default cluster.
+# Spark cluster to use for training. If set to None, uses current default cluster.
 #
-# Light processing (data preparation & prediction) uses typical Spark setup of one
-# task per CPU core.
-#
-# Training cluster should be set up to provide a Spark task per multiple CPU cores,
+# Cluster should be set up to provide a Spark task per multiple CPU cores,
 # or per GPU, e.g. by supplying `-c <NUM GPUs>` in Spark Standalone mode.
-LIGHT_PROCESSING_CLUSTER = None  # or 'spark://hostname:7077'
 TRAINING_CLUSTER = None  # or 'spark://hostname:7077'
 
 # The number of training processes.
@@ -52,9 +47,6 @@ SAMPLE_RATE = None  # or use 0.01
 BATCH_SIZE = 100
 LR = 1e-4
 
-# HDFS driver to use with Petastorm.
-PETASTORM_HDFS_DRIVER = 'libhdfs'
-
 # ================ #
 # DATA PREPARATION #
 # ================ #
@@ -65,8 +57,8 @@ print('================')
 
 # Create Spark session for data preparation.
 conf = SparkConf().setAppName('data_prep').set('spark.sql.shuffle.partitions', '16')
-if LIGHT_PROCESSING_CLUSTER:
-    conf.setMaster(LIGHT_PROCESSING_CLUSTER)
+if TRAINING_CLUSTER:
+    conf.setMaster(TRAINING_CLUSTER)
 spark = SparkSession.builder.config(conf=conf).getOrCreate()
 
 train_csv = spark.read.csv('%s/train.csv' % DATA_LOCATION, header=True)
@@ -276,9 +268,9 @@ test_df = lookup_columns(test_df, vocab)
 # Test set is in 2015, use the same period in 2014 from the training set as a validation set.
 test_min_date = test_df.agg(F.min(test_df.Date)).collect()[0][0]
 test_max_date = test_df.agg(F.max(test_df.Date)).collect()[0][0]
-a_year = datetime.timedelta(365)
-val_df = train_df.filter((test_min_date - a_year <= train_df.Date) & (train_df.Date < test_max_date - a_year))
-train_df = train_df.filter((train_df.Date < test_min_date - a_year) | (train_df.Date >= test_max_date - a_year))
+one_year = datetime.timedelta(365)
+train_df = train_df.withColumn('Validation',
+                               (train_df.Date < test_min_date - one_year) | (train_df.Date >= test_max_date - one_year))
 
 # Determine max Sales number.
 max_sales = train_df.agg(F.max(train_df.Sales)).collect()[0][0]
@@ -291,17 +283,12 @@ train_df.show()
 print('================')
 print('Data frame sizes')
 print('================')
-train_rows, val_rows, test_rows = train_df.count(), val_df.count(), test_df.count()
+train_rows = train_df.filter(train_df.Validation == 0).count()
+val_rows = train_df.filter(train_df.Validation > 0).count()
+test_rows = test_df.count()
 print('Training: %d' % train_rows)
 print('Validation: %d' % val_rows)
 print('Test: %d' % test_rows)
-
-# Save data frames as Parquet files.
-train_df.write.parquet('%s/train_df.parquet' % DATA_LOCATION, mode='overwrite')
-val_df.write.parquet('%s/val_df.parquet' % DATA_LOCATION, mode='overwrite')
-test_df.write.parquet('%s/test_df.parquet' % DATA_LOCATION, mode='overwrite')
-
-spark.stop()
 
 # ============== #
 # MODEL TRAINING #
@@ -314,8 +301,7 @@ print('==============')
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Embedding, Concatenate, Dense, Flatten, Reshape, BatchNormalization, Dropout
 import tensorflow.keras.backend as K
-import horovod.spark
-import horovod.tensorflow.keras as hvd
+import horovod.spark.keras as hvd
 
 
 def exp_rmspe(y_true, y_pred):
@@ -359,14 +345,8 @@ model.summary()
 
 opt = tf.keras.optimizers.Adam(lr=LR, epsilon=1e-3)
 
-# Create Spark session for training.
-conf = SparkConf().setAppName('training')
-if TRAINING_CLUSTER:
-    conf.setMaster(TRAINING_CLUSTER)
-spark = SparkSession.builder.config(conf=conf).getOrCreate()
-
 # Horovod: run training.
-keras_estimator = hvd.KerasEstimator(num_processes=NUM_TRAINING_PROC,
+keras_estimator = hvd.KerasEstimator(num_proc=NUM_TRAINING_PROC,
                                      model=model,
                                      optimizer=opt,
                                      loss='mae',
@@ -374,21 +354,20 @@ keras_estimator = hvd.KerasEstimator(num_processes=NUM_TRAINING_PROC,
                                      custom_objects=CUSTOM_OBJECTS,
                                      feature_cols=all_cols,
                                      label_cols=['Sales'],
+                                     validation_col='Validation',
                                      batch_size=BATCH_SIZE,
                                      epochs=100,
                                      verbose=2)
 
 keras_model = keras_estimator.fit(train_df)
 
+history = keras_estimator.getHistory()
 best_val_rmspe = min(history['val_exp_rmspe'])
 print('Best RMSPE: %f' % best_val_rmspe)
 
-# Write checkpoint.
-with open(LOCAL_CHECKPOINT_FILE, 'wb') as f:
-    f.write(best_model_bytes)
+# Save the trained model.
+keras_model.save(LOCAL_CHECKPOINT_FILE)
 print('Written checkpoint to %s' % LOCAL_CHECKPOINT_FILE)
-
-spark.stop()
 
 # ================ #
 # FINAL PREDICTION #
@@ -398,44 +377,7 @@ print('================')
 print('Final prediction')
 print('================')
 
-# Create Spark session for prediction.
-conf = SparkConf().setAppName('prediction') \
-    .setExecutorEnv('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH')) \
-    .setExecutorEnv('PATH', os.environ.get('PATH'))
-if LIGHT_PROCESSING_CLUSTER:
-    conf.setMaster(LIGHT_PROCESSING_CLUSTER)
-spark = SparkSession.builder.config(conf=conf).getOrCreate()
-
-
-def predict_fn(model_bytes):
-    def fn(rows):
-        import math
-        import tensorflow as tf
-        import tensorflow.keras.backend as K
-
-        # Do not use GPUs for prediction, use single CPU core per task.
-        config = tf.ConfigProto(device_count={'GPU': 0})
-        config.inter_op_parallelism_threads = 1
-        config.intra_op_parallelism_threads = 1
-        K.set_session(tf.Session(config=config))
-
-        # Restore from checkpoint.
-        model = deserialize_model(model_bytes, tf.keras.models.load_model)
-
-        # Perform predictions.
-        for row in rows:
-            fields = row.asDict().copy()
-            # Convert from log domain to real Sales numbers.
-            log_sales = model.predict_on_batch([[row[col]] for col in all_cols])[0]
-            # Add 'Sales' column with prediction results.
-            fields['Sales'] = math.exp(log_sales)
-            yield Row(**fields)
-
-    return fn
-
-
-pred_df = spark.read.parquet('%s/test_df.parquet' % DATA_LOCATION) \
-    .rdd.mapPartitions(predict_fn(best_model_bytes)).toDF()
+pred_df = keras_model.transform(test_df)
 submission_df = pred_df.select(pred_df.Id.cast(T.IntegerType()), pred_df.Sales).toPandas()
 submission_df.sort_values(by=['Id']).to_csv(LOCAL_SUBMISSION_CSV, index=False)
 print('Saved predictions to %s' % LOCAL_SUBMISSION_CSV)
