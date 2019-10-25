@@ -32,6 +32,7 @@ from pyspark.ml.param.shared import Param, Params
 from pyspark.ml.util import MLWritable, MLReadable
 
 from horovod.spark.common import util
+from horovod.spark.common.backend import SparkBackend
 from horovod.spark.common.params import EstimatorParams, ModelParams
 from horovod.spark.common.serialization import \
     HorovodParamsWriter, HorovodParamsReader
@@ -283,6 +284,7 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
 
     @keyword_only
     def __init__(self,
+                 num_proc=None,
                  model=None,
                  backend=None,
                  store=None,
@@ -302,7 +304,8 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
                  epochs=None,
                  validation_split=None,
                  verbose=1,
-                 shuffle_buffer_size=None):
+                 shuffle_buffer_size=None,
+                 partitions_per_process=None):
         super(TorchEstimator, self).__init__()
         self._setDefault(loss_constructor=None)
 
@@ -352,15 +355,16 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
         else:
             return self._get_optimizer()
 
+    def _check_model_compatibility(self, metadata):
+        util.check_shape_compatibility(metadata,
+                                       self.getFeatureCols(),
+                                       self.getLabelCols(),
+                                       input_shapes=self.getInputShapes())
+
     def _fit(self, df):
-
-        model_pre_train = self.getModel()
-        serialized_model = util.serialize(model_pre_train)
-
         optimizer = self._get_optimizer()
         loss_fns_pre_train = self.getLoss()
         loss_constructors = self.getLossConstructors()
-
         compression = self.getCompression()
         backend = self.getBackend()
         store = self.getStore()
@@ -375,19 +379,29 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
         validation_col = self.getValidationCol()
         metric_fn_groups = self.getMetrics()
         user_shuffle_buffer_size = self.getShufflingBufferSize()
+        partitions_per_process = self.getPartitionsPerProcess()
+
+        num_processes = self.getNumProc()
+        if (num_processes is None) == (backend is None):
+            raise ValueError('Exactly one of parameters "num_processes" and "backend" '
+                             'must be specified')
+        elif backend is None:
+            backend = SparkBackend(num_processes)
+        elif num_processes is None:
+            num_processes = backend.num_processes()
 
         train_rows, val_rows, metadata, avg_row_size = \
-            util.prepare_data(backend,
+            util.prepare_data(num_processes,
                               store,
                               df,
                               label_columns=label_columns,
                               feature_columns=feature_columns,
                               validation_split=validation_split,
                               validation_col=validation_col,
-                              sample_weight_col=sample_weight_col)
+                              sample_weight_col=sample_weight_col,
+                              partitions_per_process=partitions_per_process)
 
-        util.check_model_compatibility(metadata, feature_columns, label_columns,
-                                       input_shapes)
+        self._check_model_compatibility(metadata)
 
         train_data_path = store.get_train_data_path()
         validation_data_path = store.get_val_data_path()
@@ -412,6 +426,9 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
         calculate_loss_fn = calculate_loss_generator()
         serialize_fn = util.serialize_generator()
         deserialize_fn = util.deserialize_generator()
+
+        model_pre_train = self.getModel()
+        serialized_model = util.serialize(model_pre_train)
 
         def train():
             import io
@@ -664,8 +681,7 @@ class TorchEstimator(Estimator, EstimatorParams, TorchEstimatorParamsWritable,
 
                 return history, serialize_fn(loaded_model), serialize_fn(bio_opt)
 
-        history, serialized_model, serialized_optimizer = \
-            backend.run(train, env={}, stdout=sys.stdout, stderr=sys.stdout)[0]
+        history, serialized_model, serialized_optimizer = backend.run(train, env={})[0]
 
         trained_model = codec.loads_base64(serialized_model)
 

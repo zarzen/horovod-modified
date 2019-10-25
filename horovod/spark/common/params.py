@@ -22,6 +22,7 @@ from pyspark.ml.param.shared import HasOutputCols, Param, Params, TypeConverters
 
 
 class EstimatorParams(Params):
+    num_proc = Param(Params._dummy(), 'num_proc', 'number of processes')
     optimizer = Param(Params._dummy(), 'optimizer', 'optimizer')
     model = Param(Params._dummy(), 'model', 'model')
     backend = Param(Params._dummy(), 'backend', 'backend')
@@ -58,10 +59,15 @@ class EstimatorParams(Params):
     verbose = Param(Params._dummy(), 'verbose', 'verbose',
                     typeConverter=TypeConverters.toInt)
 
+    partitions_per_process = Param(Params._dummy(), 'partitions_per_process',
+                                   'partitions for parquet form of the DataFrame per process',
+                                   typeConverter=TypeConverters.toInt)
+
     def __init__(self):
         super(EstimatorParams, self).__init__()
 
         self._setDefault(
+            num_proc=None,
             model=None,
             optimizer=None,
             loss=None,
@@ -77,7 +83,8 @@ class EstimatorParams(Params):
             verbose=1,
             callbacks=[],
             validation_split=0.0,
-            shuffle_buffer_size=None)
+            shuffle_buffer_size=None,
+            partitions_per_process=10)
 
     def _should_validate(self):
         return self.getValidationCol() is not None or self.getValidationSplit() > 0
@@ -85,6 +92,12 @@ class EstimatorParams(Params):
     @keyword_only
     def setParams(self, **kwargs):
         return self._set(**kwargs)
+
+    def setNumProc(self, value):
+        return self._set(num_proc=value)
+
+    def getNumProc(self):
+        return self.getOrDefault(self.num_proc)
 
     def setModel(self, value):
         return self._set(model=value)
@@ -193,6 +206,12 @@ class EstimatorParams(Params):
 
     def getOptimizer(self):
         return self.getOrDefault(self.optimizer)
+
+    def setPartitionsPerProcess(self, value):
+        return self._set(partitions_per_process=value)
+
+    def getPartitionsPerProcess(self):
+        return self.getOrDefault(self.partitions_per_process)
 
 
 class ModelParams(HasOutputCols):

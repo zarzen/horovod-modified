@@ -35,6 +35,7 @@ from pyspark.ml.param.shared import Param, Params
 from horovod.run.common.util import codec
 
 from horovod.spark.common import util
+from horovod.spark.common.backend import SparkBackend
 from horovod.spark.common.params import EstimatorParams, ModelParams
 from horovod.spark.common.serialization import \
     HorovodParamsWriter, HorovodParamsReader
@@ -281,8 +282,7 @@ def calculate_shuffle_buffer_size_generator():
         shuffle_buffer_size = 0.5 GB
         """
         local_size = hvd.local_size()
-        print(hvd.__path__)
-        local_sizes = [1] #hvd.allgather([local_size])
+        local_sizes = hvd.allgather([local_size])
         max_local_size = max(local_sizes)
 
         if max_local_size > TOTAL_BUFFER_MEMORY_CAP:
@@ -487,6 +487,7 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
 
     @keyword_only
     def __init__(self,
+                 num_proc=None,
                  model=None,
                  backend=None,
                  store=None,
@@ -505,7 +506,8 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
                  epochs=None,
                  validation_split=None,
                  verbose=None,
-                 shuffle_buffer_size=None):
+                 shuffle_buffer_size=None,
+                 partitions_per_process=None):
 
         super(KerasEstimator, self).__init__()
 
@@ -565,6 +567,13 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
     def getCustomObjects(self):
         return self.getOrDefault(self.custom_objects)
 
+    def _check_model_compatibility(self, metadata, input_shapes, output_shapes):
+        util.check_shape_compatibility(metadata,
+                                       self.getFeatureCols(),
+                                       self.getLabelCols(),
+                                       input_shapes=input_shapes,
+                                       output_shapes=output_shapes)
+
     def _fit(self, df):
         backend = self.getBackend()
         store = self.getStore()
@@ -579,16 +588,27 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
         custom_objects = self.getCustomObjects()
         validation_col = self.getValidationCol()
         keras_utils = self._get_keras_utils()
+        partitions_per_process = self.getPartitionsPerProcess()
+
+        num_processes = self.getNumProc()
+        if (num_processes is None) == (backend is None):
+            raise ValueError('Exactly one of parameters "num_processes" and "backend" '
+                             'must be specified')
+        elif backend is None:
+            backend = SparkBackend(num_processes)
+        elif num_processes is None:
+            num_processes = backend.num_processes()
 
         train_rows, val_rows, metadata, avg_row_size = \
-            util.prepare_data(backend,
+            util.prepare_data(num_processes,
                               store,
                               df,
                               label_columns=label_columns,
                               feature_columns=feature_columns,
                               validation_col=validation_col,
                               validation_split=validation_split,
-                              sample_weight_col=sample_weight_col)
+                              sample_weight_col=sample_weight_col,
+                              partitions_per_process=partitions_per_process)
 
         # Check if any of the columns are only SparseVector
         has_sparse_col = any(metadata[col_name]['training_data_type'] == util.SPARSE_VECTOR
@@ -618,67 +638,54 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
             raise ValueError('Optimizer must be provided either as a parameter or as part of a '
                              'compiled model')
 
-        # Get input and output shapes and dtypes
+        # Get input and output shapes
         input_shapes = [[dim if dim else -1 for dim in input.shape.as_list()]
                         for input in model.inputs]
-        input_dtypes = [type(model_input.dtype.as_numpy_dtype())
-                        for model_input in model.inputs]
-
         output_shapes = [[dim if dim else -1 for dim in output.shape.as_list()]
                          for output in model.outputs]
         output_names = model.output_names
 
-        # # Check for model and input type incompatibility. Feature columns must have the same size
-        # # (total number of elements) and data types of the corresponding inputs.
-        # # Same applies to label columns and outputs for shape, but type only needs to be castable.
-        # util.check_model_compatibility(metadata, feature_columns, label_columns,
-        #                                input_shapes, output_shapes, input_dtypes)
-        # metrics = self.getMetrics()
-        # compression = self.getCompression()
-        # optimizer_weight_values = optimizer.get_weights()
-        #
-        # dist_optimizer_args = dict(optimizer=optimizer)
-        # if compression:
-        #     dist_optimizer_args['compression'] = compression
-        #
-        # # Horovod: wrap optimizer with DistributedOptimizer.
-        # dist_optimizer = keras_utils.get_horovod().DistributedOptimizer(**dist_optimizer_args)
-        # model.compile(optimizer=dist_optimizer,
-        #               loss=loss,
-        #               loss_weights=loss_weights,
-        #               metrics=metrics)
-        #
-        # if optimizer_weight_values:
-        #     model.optimizer.set_weights(optimizer_weight_values)
-        #
-        # serialized_model = keras_utils.serialize_model(model)
-        # keras_type = keras_utils.type
-        #
-        # get_petastorm_path = store.get_petastorm_path_generator()
-        #
-        # keras_module = keras_utils.keras()
-        # floatx = keras_module.backend.floatx()
-        #
-        # # Functions:
-        # serialize = util.serialize_generator()
-        # deserialize_keras_model_fn = _deserialize_keras_model_generator()
-        # calculate_shuffle_buffer_size_fn = calculate_shuffle_buffer_size_generator()
-        # batch_generator_fn = batch_generator_generator(feature_columns, label_columns,
-        #                                                sample_weight_col, input_shapes,
-        #                                                output_shapes,
-        #                                                batch_size, metadata)
-        # reshape_fn = reshape_genrator(sample_weight_col, feature_columns, label_columns, metadata)
-        # prep_data_tf_keras_fn = \
-        #     prep_data_tf_keras_generator(has_sparse_col, sample_weight_col,
-        #                                  feature_columns, label_columns, input_shapes,
-        #                                  output_shapes, output_names)
+        self._check_model_compatibility(metadata, input_shapes, output_shapes)
 
-        # serialized_model = _serialize_keras_model(model, save_model_fn=tf.keras.models.save_model)
+        metrics = self.getMetrics()
+        compression = self.getCompression()
+        optimizer_weight_values = optimizer.get_weights()
 
-        # bio = io.BytesIO()
-        with h5py.File('/tmp/model', 'w') as f:
-            tf.keras.models.save_model(model, f)
-        # serialized_model = codec.dumps_base64(bio.getvalue())
+        dist_optimizer_args = dict(optimizer=optimizer)
+        if compression:
+            dist_optimizer_args['compression'] = compression
+
+        # Horovod: wrap optimizer with DistributedOptimizer.
+        dist_optimizer = keras_utils.get_horovod().DistributedOptimizer(**dist_optimizer_args)
+        model.compile(optimizer=dist_optimizer,
+                      loss=loss,
+                      loss_weights=loss_weights,
+                      metrics=metrics)
+
+        if optimizer_weight_values:
+            model.optimizer.set_weights(optimizer_weight_values)
+
+        serialized_model = keras_utils.serialize_model(model)
+        keras_type = keras_utils.type
+
+        get_petastorm_path = store.get_petastorm_path_generator()
+
+        keras_module = keras_utils.keras()
+        floatx = keras_module.backend.floatx()
+
+        # Functions:
+        serialize = util.serialize_generator()
+        deserialize_keras_model_fn = _deserialize_keras_model_generator()
+        calculate_shuffle_buffer_size_fn = calculate_shuffle_buffer_size_generator()
+        batch_generator_fn = batch_generator_generator(feature_columns, label_columns,
+                                                       sample_weight_col, input_shapes,
+                                                       output_shapes,
+                                                       batch_size, metadata)
+        reshape_fn = reshape_genrator(sample_weight_col, feature_columns, label_columns, metadata)
+        prep_data_tf_keras_fn = \
+            prep_data_tf_keras_generator(has_sparse_col, sample_weight_col,
+                                         feature_columns, label_columns, input_shapes,
+                                         output_shapes, output_names)
 
         def train():
             import tempfile
@@ -687,229 +694,196 @@ class KerasEstimator(Estimator, EstimatorParams, KerasEstimatorParamsReadable,
             from petastorm import make_batch_reader
             from petastorm.tf_utils import make_petastorm_dataset
 
-            import tensorflow as tf
+            def _get_keras(type):
+                if type == BARE_KERAS:
+                    import keras
+                    return keras
+                else:
+                    import tensorflow.keras as tf_keras
+                    return tf_keras
 
-            import horovod.tensorflow.keras as hvd
+            def _get_hvd(type):
+                if type == BARE_KERAS:
+                    import horovod.keras as hvd
+                    return hvd
+                else:
+                    import horovod.tensorflow.keras as hvd
+                    return hvd
+
+            @contextlib.contextmanager
+            def _tempdir():
+                dirpath = tempfile.mkdtemp()
+                try:
+                    yield dirpath
+                finally:
+                    shutil.rmtree(dirpath)
+
+            k = _get_keras(keras_type)
+            k.backend.set_floatx(floatx)
+
+            hvd = _get_hvd(keras_type)
             hvd.init()
-            local_size = hvd.local_size()
-            print(hvd.__path__)
-            import sys
-            for m in [x for x in sorted(sys.modules.keys()) if '.' not in x]:
-                print(m)
 
-            local_sizes = hvd.allgather([local_size])
-            print(local_sizes)
-            return None, None, 1
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            config.gpu_options.visible_device_list = str(hvd.local_rank())
+            k.backend.set_session(tf.Session(config=config))
 
-        # def train():
-        #     import tempfile
-        #     import shutil
-        #     import contextlib
-        #     from petastorm import make_batch_reader
-        #     from petastorm.tf_utils import make_petastorm_dataset
-        #
-        #     def _get_keras(type):
-        #         if type == BARE_KERAS:
-        #             import keras
-        #             return keras
-        #         else:
-        #             import tensorflow.keras as tf_keras
-        #             return tf_keras
-        #
-        #     def _get_hvd(type):
-        #         if type == BARE_KERAS:
-        #             import horovod.keras as hvd
-        #             return hvd
-        #         else:
-        #             import horovod.tensorflow.keras as hvd
-        #             return hvd
-        #
-        #     @contextlib.contextmanager
-        #     def _tempdir():
-        #         dirpath = tempfile.mkdtemp()
-        #         try:
-        #             yield dirpath
-        #         finally:
-        #             shutil.rmtree(dirpath)
-        #
-        #     # k = _get_keras(keras_type)
-        #     # k.backend.set_floatx(floatx)
-        #
-        #     # hvd = _get_hvd(keras_type)
-        #
-        #     import horovod.tensorflow.keras as hvd
-        #     hvd.init()
-        #
-        #     local_size = hvd.local_size()
-        #     print(hvd.__path__)
-        #     import sys
-        #     for m in [x for x in sorted(sys.modules.keys()) if '.' not in x]:
-        #         print(m)
-        #
-        #     local_sizes = hvd.allgather([local_size])
-        #
-        #     # config = tf.ConfigProto()
-        #     # config.gpu_options.allow_growth = True
-        #     # config.gpu_options.visible_device_list = str(hvd.local_rank())
-        #     # k.backend.set_session(tf.Session(config=config))
-        #     #
-        #     # if not user_shuffle_buffer_size:
-        #     #     shuffle_buffer_size = \
-        #     #         calculate_shuffle_buffer_size_fn(hvd, avg_row_size, train_rows / hvd.size())
-        #     # else:
-        #     #     shuffle_buffer_size = user_shuffle_buffer_size
-        #
-        #     return None, serialized_model, 1
+            if not user_shuffle_buffer_size:
+                shuffle_buffer_size = \
+                    calculate_shuffle_buffer_size_fn(hvd, avg_row_size, train_rows / hvd.size())
+            else:
+                shuffle_buffer_size = user_shuffle_buffer_size
 
-            # # needs to be deserialized in the with scope
-            # with k.utils.custom_object_scope(custom_objects):
-            #     model = deserialize_keras_model_fn(serialized_model, lambda x: hvd.load_model(x))
+            # needs to be deserialized in the with scope
+            with k.utils.custom_object_scope(custom_objects):
+                model = deserialize_keras_model_fn(serialized_model, lambda x: hvd.load_model(x))
 
-            # # Horovod: adjust learning rate based on number of processes.
-            # k.backend.set_value(model.optimizer.lr,
-            #                     k.backend.get_value(model.optimizer.lr) * hvd.size())
-            #
-            # # Verbose mode 1 will print a progress bar
-            # verbose = user_verbose if hvd.rank() == 0 else 0
-            #
-            # callbacks = [
-            #     # Horovod: broadcast initial variable states from rank 0 to all other processes.
-            #     # This is necessary to ensure consistent initialization of all workers when
-            #     # training is started with random weights or restored from a checkpoint.
-            #     hvd.callbacks.BroadcastGlobalVariablesCallback(root_rank=0),
-            #
-            #     # Horovod: average metrics among workers at the end of every epoch.
-            #     #
-            #     # Note: This callback must be in the list before the ReduceLROnPlateau,
-            #     # TensorBoard, or other metrics-based callbacks.
-            #     hvd.callbacks.MetricAverageCallback(),
-            # ]
-            # callbacks += user_callbacks
-            #
-            # steps_per_epoch = int(math.ceil(train_rows / batch_size / hvd.size()))
-            # # math.ceil because if val_rows is smaller than batch_size we still get the at least
-            # # one step. float(val_rows) because val_rows/batch_size evaluates to zero before
-            # # math.ceil
-            # validation_steps = int(math.ceil(float(val_rows) / batch_size / hvd.size()))
-            #
-            # schema_fields = feature_columns + label_columns
-            # if sample_weight_col:
-            #     schema_fields.append(sample_weight_col)
-            #
-            # with _tempdir() as ckpt_dir:
-            #     # Model checkpoint location.
-            #     ckpt_file = os.path.join(ckpt_dir, 'checkpoint.h5')
-            #
-            #     # Horovod: save checkpoints only on the first worker to prevent other workers from
-            #     # corrupting them.
-            #     if hvd.rank() == 0:
-            #         callbacks.append(k.callbacks.ModelCheckpoint(ckpt_file))
-            #
-            #     # Petastorm: read data from the store with the correct shard for this rank
-            #     with make_batch_reader(get_petastorm_path(train_data_path),
-            #                            shuffle_row_groups=True,
-            #                            # setting num_epochs=None will cause an infinite iterator
-            #                            num_epochs=None,
-            #                            cur_shard=hvd.rank(),
-            #                            shard_count=hvd.size(),
-            #                            hdfs_driver=PETASTORM_HDFS_DRIVER,
-            #                            schema_fields=schema_fields) as train_reader:
-            #
-            #         if keras_type == TF_KERAS:
-            #             if has_sparse_col:
-            #                 train_ds = make_petastorm_dataset(train_reader) \
-            #                     .apply(tf.data.experimental.unbatch()) \
-            #                     .shuffle(shuffle_buffer_size) \
-            #                     .batch(1) \
-            #                     .map(reshape_fn) \
-            #                     .batch(batch_size) \
-            #                     .map(prep_data_tf_keras_fn)
-            #             else:
-            #                 train_ds = make_petastorm_dataset(train_reader) \
-            #                     .apply(tf.data.experimental.unbatch()) \
-            #                     .shuffle(shuffle_buffer_size) \
-            #                     .batch(batch_size) \
-            #                     .map(prep_data_tf_keras_fn)
-            #
-            #             if should_validate:
-            #                 # setting num_epochs=None will cause an infinite iterator and enables
-            #                 # ranks to perform training and validation with unequal number of
-            #                 # samples
-            #                 with make_batch_reader(
-            #                         get_petastorm_path(val_data_path),
-            #                         num_epochs=None,
-            #                         cur_shard=hvd.rank(),
-            #                         shard_count=hvd.size(),
-            #                         hdfs_driver=PETASTORM_HDFS_DRIVER,
-            #                         schema_fields=schema_fields) as val_reader:
-            #
-            #                     if has_sparse_col:
-            #                         val_ds = make_petastorm_dataset(val_reader) \
-            #                             .apply(tf.data.experimental.unbatch()) \
-            #                             .batch(1) \
-            #                             .map(reshape_fn) \
-            #                             .batch(batch_size) \
-            #                             .map(prep_data_tf_keras_fn)
-            #                     else:
-            #                         val_ds = make_petastorm_dataset(val_reader) \
-            #                             .apply(tf.data.experimental.unbatch()) \
-            #                             .batch(batch_size) \
-            #                             .map(prep_data_tf_keras_fn)
-            #
-            #                     history = model.fit(
-            #                         train_ds,
-            #                         validation_data=val_ds,
-            #                         steps_per_epoch=steps_per_epoch,
-            #                         validation_steps=validation_steps,
-            #                         callbacks=callbacks,
-            #                         verbose=verbose,
-            #                         epochs=epochs)
-            #             else:
-            #                 history = model.fit(
-            #                     train_ds,
-            #                     steps_per_epoch=steps_per_epoch,
-            #                     callbacks=callbacks,
-            #                     verbose=verbose,
-            #                     epochs=epochs)
-            #
-            #         elif keras_type == BARE_KERAS:
-            #
-            #             if should_validate:
-            #                 # setting num_epochs=None will cause an infinite iterator and enables
-            #                 # ranks to perform training and validation with unequal number of
-            #                 # samples
-            #                 with make_batch_reader(get_petastorm_path(val_data_path),
-            #                                        num_epochs=None,
-            #                                        cur_shard=hvd.rank(),
-            #                                        shard_count=hvd.size(),
-            #                                        hdfs_driver=PETASTORM_HDFS_DRIVER,
-            #                                        schema_fields=schema_fields) as val_reader:
-            #                     history = model.fit_generator(
-            #                         generator=batch_generator_fn(train_reader, shuffle_buffer_size),
-            #                         steps_per_epoch=steps_per_epoch,
-            #                         validation_data=batch_generator_fn(val_reader,
-            #                                                            shuffle_buffer_size),
-            #                         validation_steps=validation_steps,
-            #                         callbacks=callbacks,
-            #                         verbose=verbose,
-            #                         epochs=epochs)
-            #
-            #             else:
-            #                 history = model.fit_generator(generator=batch_generator_fn(
-            #                     train_reader, shuffle_buffer_size),
-            #                     steps_per_epoch=steps_per_epoch,
-            #                     callbacks=callbacks,
-            #                     verbose=verbose,
-            #                     epochs=epochs)
-            #
-            #     # Dataset API usage currently displays a wall of errors upon termination.
-            #     # This global model registration ensures clean termination.
-            #     # Tracked in https://github.com/tensorflow/tensorflow/issues/24570
-            #     globals()['_DATASET_FINALIZATION_HACK'] = model
-            #
-            #     if hvd.rank() == 0:
-            #         with open(ckpt_file, 'rb') as f:
-            #             return history.history, serialize(f.read()), hvd.size()
+            # Horovod: adjust learning rate based on number of processes.
+            k.backend.set_value(model.optimizer.lr,
+                                k.backend.get_value(model.optimizer.lr) * hvd.size())
+
+            # Verbose mode 1 will print a progress bar
+            verbose = user_verbose if hvd.rank() == 0 else 0
+
+            callbacks = [
+                # Horovod: broadcast initial variable states from rank 0 to all other processes.
+                # This is necessary to ensure consistent initialization of all workers when
+                # training is started with random weights or restored from a checkpoint.
+                hvd.callbacks.BroadcastGlobalVariablesCallback(root_rank=0),
+
+                # Horovod: average metrics among workers at the end of every epoch.
+                #
+                # Note: This callback must be in the list before the ReduceLROnPlateau,
+                # TensorBoard, or other metrics-based callbacks.
+                hvd.callbacks.MetricAverageCallback(),
+            ]
+            callbacks += user_callbacks
+
+            steps_per_epoch = int(math.ceil(train_rows / batch_size / hvd.size()))
+            # math.ceil because if val_rows is smaller than batch_size we still get the at least
+            # one step. float(val_rows) because val_rows/batch_size evaluates to zero before
+            # math.ceil
+            validation_steps = int(math.ceil(float(val_rows) / batch_size / hvd.size()))
+
+            schema_fields = feature_columns + label_columns
+            if sample_weight_col:
+                schema_fields.append(sample_weight_col)
+
+            with _tempdir() as ckpt_dir:
+                # Model checkpoint location.
+                ckpt_file = os.path.join(ckpt_dir, 'checkpoint.h5')
+
+                # Horovod: save checkpoints only on the first worker to prevent other workers from
+                # corrupting them.
+                if hvd.rank() == 0:
+                    callbacks.append(k.callbacks.ModelCheckpoint(ckpt_file))
+
+                # Petastorm: read data from the store with the correct shard for this rank
+                with make_batch_reader(get_petastorm_path(train_data_path),
+                                       shuffle_row_groups=True,
+                                       # setting num_epochs=None will cause an infinite iterator
+                                       num_epochs=None,
+                                       cur_shard=hvd.rank(),
+                                       shard_count=hvd.size(),
+                                       hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                       schema_fields=schema_fields) as train_reader:
+
+                    if keras_type == TF_KERAS:
+                        if has_sparse_col:
+                            train_ds = make_petastorm_dataset(train_reader) \
+                                .apply(tf.data.experimental.unbatch()) \
+                                .shuffle(shuffle_buffer_size) \
+                                .batch(1) \
+                                .map(reshape_fn) \
+                                .batch(batch_size) \
+                                .map(prep_data_tf_keras_fn)
+                        else:
+                            train_ds = make_petastorm_dataset(train_reader) \
+                                .apply(tf.data.experimental.unbatch()) \
+                                .shuffle(shuffle_buffer_size) \
+                                .batch(batch_size) \
+                                .map(prep_data_tf_keras_fn)
+
+                        if should_validate:
+                            # setting num_epochs=None will cause an infinite iterator and enables
+                            # ranks to perform training and validation with unequal number of
+                            # samples
+                            with make_batch_reader(
+                                    get_petastorm_path(val_data_path),
+                                    num_epochs=None,
+                                    cur_shard=hvd.rank(),
+                                    shard_count=hvd.size(),
+                                    hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                    schema_fields=schema_fields) as val_reader:
+
+                                if has_sparse_col:
+                                    val_ds = make_petastorm_dataset(val_reader) \
+                                        .apply(tf.data.experimental.unbatch()) \
+                                        .batch(1) \
+                                        .map(reshape_fn) \
+                                        .batch(batch_size) \
+                                        .map(prep_data_tf_keras_fn)
+                                else:
+                                    val_ds = make_petastorm_dataset(val_reader) \
+                                        .apply(tf.data.experimental.unbatch()) \
+                                        .batch(batch_size) \
+                                        .map(prep_data_tf_keras_fn)
+
+                                history = model.fit(
+                                    train_ds,
+                                    validation_data=val_ds,
+                                    steps_per_epoch=steps_per_epoch,
+                                    validation_steps=validation_steps,
+                                    callbacks=callbacks,
+                                    verbose=verbose,
+                                    epochs=epochs)
+                        else:
+                            history = model.fit(
+                                train_ds,
+                                steps_per_epoch=steps_per_epoch,
+                                callbacks=callbacks,
+                                verbose=verbose,
+                                epochs=epochs)
+
+                    elif keras_type == BARE_KERAS:
+
+                        if should_validate:
+                            # setting num_epochs=None will cause an infinite iterator and enables
+                            # ranks to perform training and validation with unequal number of
+                            # samples
+                            with make_batch_reader(get_petastorm_path(val_data_path),
+                                                   num_epochs=None,
+                                                   cur_shard=hvd.rank(),
+                                                   shard_count=hvd.size(),
+                                                   hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                                   schema_fields=schema_fields) as val_reader:
+                                history = model.fit_generator(
+                                    generator=batch_generator_fn(train_reader, shuffle_buffer_size),
+                                    steps_per_epoch=steps_per_epoch,
+                                    validation_data=batch_generator_fn(val_reader,
+                                                                       shuffle_buffer_size),
+                                    validation_steps=validation_steps,
+                                    callbacks=callbacks,
+                                    verbose=verbose,
+                                    epochs=epochs)
+
+                        else:
+                            history = model.fit_generator(generator=batch_generator_fn(
+                                train_reader, shuffle_buffer_size),
+                                steps_per_epoch=steps_per_epoch,
+                                callbacks=callbacks,
+                                verbose=verbose,
+                                epochs=epochs)
+
+                # Dataset API usage currently displays a wall of errors upon termination.
+                # This global model registration ensures clean termination.
+                # Tracked in https://github.com/tensorflow/tensorflow/issues/24570
+                globals()['_DATASET_FINALIZATION_HACK'] = model
+
+                if hvd.rank() == 0:
+                    with open(ckpt_file, 'rb') as f:
+                        return history.history, serialize(f.read()), hvd.size()
 
         # Workaround:
         # https://stackoverflow.com/questions/50583056/is-there-any-way-to-set-java-opts-for-tensorflow-process/50615570

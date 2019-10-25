@@ -100,22 +100,24 @@ def data_type_to_numpy(dtype):
         raise ValueError('Unrecognized data type: {}'.format(dtype))
 
 
-def check_model_compatibility(metadata, feature_columns, label_columns,
-                              input_shapes, output_shapes=None,
-                              input_dtypes=None, output_dtypes=None):
+def check_shape_compatibility(metadata, feature_columns, label_columns,
+                              input_shapes=None, output_shapes=None):
+    # Check for model and input type incompatibility. Columns must have the same size
+    # (total number of elements) of the corresponding inputs.
     feature_count = len(feature_columns)
-    if feature_count != len(input_shapes):
-        raise ValueError('Feature column count {features} must equal '
-                         'model inputs count {inputs}'
-                         .format(features=feature_count, inputs=len(input_shapes)))
+    if input_shapes is not None:
+        if feature_count != len(input_shapes):
+            raise ValueError('Feature column count {features} must equal '
+                             'model inputs count {inputs}'
+                             .format(features=feature_count, inputs=len(input_shapes)))
 
-    for idx, col, input_shape in zip(range(feature_count), feature_columns, input_shapes):
-        col_size = metadata[col]['shape']
-        input_size = abs(np.prod(input_shape))
-        if col_size != input_size:
-            raise ValueError('Feature column \'{col}\' with size {feature} must equal that of the '
-                             'model input at index {idx} with size {input}'
-                             .format(col=col, feature=col_size, idx=idx, input=input_size))
+        for idx, col, input_shape in zip(range(feature_count), feature_columns, input_shapes):
+            col_size = metadata[col]['shape']
+            input_size = abs(np.prod(input_shape))
+            if col_size != input_size:
+                raise ValueError('Feature column \'{col}\' with size {feature} must equal that of '
+                                 'the model input at index {idx} with size {input}'
+                                 .format(col=col, feature=col_size, idx=idx, input=input_size))
 
     label_count = len(label_columns)
     if output_shapes is not None:
@@ -131,22 +133,6 @@ def check_model_compatibility(metadata, feature_columns, label_columns,
                 raise ValueError('Label column \'{col}\' with size {label} must equal that of the '
                                  'model output at index {idx} with size {output}'
                                  .format(col=col, label=col_size, idx=idx, output=output_size))
-
-    if input_dtypes is not None:
-        for idx, col, input_dtype in zip(range(feature_count), feature_columns, input_dtypes):
-            col_dtype = data_type_to_numpy(metadata[col]['spark_data_type'])
-            if col_dtype != input_dtype:
-                raise ValueError('Feature column \'{col}\' with data type {feature} must be equal '
-                                 'to data type {input} for model input at index {idx}'
-                                 .format(col=col, feature=col_dtype, input=input_dtype, idx=idx))
-
-    if output_dtypes is not None:
-        for idx, col, output_dtype in zip(range(label_count), label_columns, output_dtypes):
-            col_dtype = data_type_to_numpy(metadata[col]['spark_data_type'])
-            if col_dtype != output_dtype:
-                raise ValueError('Label column \'{col}\' with data type {label} must be equal '
-                                 'to data type {output} for model output at index {idx}'
-                                 .format(col=col, label=col_dtype, output=output_dtype, idx=idx))
 
 
 def _get_col_info(df):
@@ -312,13 +298,13 @@ def to_petastorm_generator(schema_cols, metadata):
     return to_petastorm
 
 
-def prepare_data(backend, store, df, label_columns, feature_columns,
-                 validation_col=None, validation_split=None, sample_weight_col=None):
+def prepare_data(num_processes, store, df, label_columns, feature_columns,
+                 validation_col=None, validation_split=None, sample_weight_col=None,
+                 partitions_per_process=10):
     if validation_split and validation_col:
         raise ValueError("can only specify one of validation_col and validation_split")
 
-    num_processes = backend.num_processes()
-    num_partitions = num_processes * 10
+    num_partitions = num_processes * partitions_per_process
     print('num_partitions={}'.format(num_partitions))
 
     train_data_path = store.get_train_data_path()
