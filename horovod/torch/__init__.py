@@ -42,12 +42,35 @@ from horovod.torch.mpi_ops import nccl_built, ddl_built, mlsl_built
 
 import torch
 import collections
+import logging
+import os
+from datetime import datetime
+import time
+import json
 
+def _init_logging():
+    logdir = "~/horovod_logs"
+    logdir = os.path.expanduser(logdir)
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+    dt = datetime.fromtimestamp(time.time())
+    timestamp = dt.strftime("%Y%m%d-%H%M%S")
+    logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, local_rank()))
+    print(logging_file)
+    logging.basicConfig(level=logging.DEBUG, format='%(message)s')
+    logger = logging.getLogger(__name__)
+    f_handler = logging.FileHandler(logging_file, mode='w')
+    f_handler.setLevel(logging.DEBUG)
+    f_format = logging.Formatter('%(message)s')
+    f_handler.setFormatter(f_format)
+    logger.addHandler(f_handler)
+    return logger
 
 class _DistributedOptimizer(torch.optim.Optimizer):
     def __init__(self, params, named_parameters, compression,
                  backward_passes_per_step=1):
         super(self.__class__, self).__init__(params)
+        self.logger = _init_logging()
         self._compression = compression
 
         if named_parameters is not None:
@@ -123,6 +146,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         handle = allreduce_async_(tensor_compressed, average=True, name=name)
         return handle, ctx
+    
+    def _log_grad_complete(self, p):
+        """"""
+        pname = self._parameter_names.get(p)
+        # import pdb;pdb.set_trace()
+        # print(type(pname), pname)
+        # print(type(local_rank), local_rank)
+        lobj = {"ph": "X", "name": pname, "ts": time.time(), "pid": local_rank(), "dur": 1e-6}
+        self.logger.debug(json.dumps(lobj))
 
     def _make_hook(self, p):
         def hook(*ignore):
@@ -135,6 +167,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         "accumulate gradients locally.")
             assert not p.grad.requires_grad
             assert self._allreduce_delay[p] > 0
+            # log the completing time
+            self._log_grad_complete(p)
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
