@@ -13,24 +13,76 @@
 // limitations under the License.
 // =============================================================================
 
+#include <sstream>
+#include <ctime>
+#include <iomanip>
+
+#include <cstdlib>
 #include <chrono>
 #include <memory>
 #include <thread>
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <sys/stat.h>
 
 #include "../common/operations.h"
 #include "adapter_v2.h"
 #include "cuda_util.h"
 #include "handle_manager.h"
 #include "ready_event.h"
+#include "spdlog/spdlog.h"
+#include "spdlog/sinks/basic_file_sink.h"
 
 namespace horovod {
 namespace torch {
 
+std::string _current_time_and_date() {
+  auto now = std::chrono::system_clock::now();
+  auto in_time_t = std::chrono::system_clock::to_time_t(now);
+
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d.%H:%M:%S");
+  return ss.str();
+}
+
+std::string _get_logpath() {
+  static auto _user_home =  std::string(std::getenv("HOME"));
+  std::string _timestamp = _current_time_and_date();
+  std::string _log_dir = _user_home + "/horovod_logs/mpi_events/";
+  bool _flag = mkdir(_log_dir.c_str(), 0777);
+  std::cout << "create dir: " << _log_dir << ", status: " << _flag << "\n";
+  static std::string _logfile = _log_dir
+    + _timestamp 
+    + "-rank-" + std::to_string(horovod_rank())
+    + ".log";
+  return _logfile;
+}
+
+std::shared_ptr<spdlog::logger> _get_logger() {
+  spdlog::set_pattern("%v");
+  auto _logger = spdlog::basic_logger_mt("basic_logger", _get_logpath());
+  return _logger;
+}
+
+std::string _fmt_msg(std::string event, std::string tensor_name) {
+  long timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  std::stringstream _ss;
+  _ss << event << "," << tensor_name << "," << timestamp;
+  return _ss.str();
+}
+
+
 static HandleManager handle_manager;
+static std::shared_ptr<spdlog::logger> _event_logger;
 
 namespace {
+
+void check_logger() {
+  if (!horovod::torch::_event_logger) {
+    horovod::torch::_event_logger = _get_logger();
+  }
+}
 
 std::string GetOpName(const std::string& prefix, const std::string& name,
                       int handle) {
@@ -52,6 +104,8 @@ int GetDeviceID(const ::torch::Tensor& tensor) {
 int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
                 const std::string& name) {
   ThrowIfError(common::CheckInitialized());
+  check_logger();
+  _event_logger->info(_fmt_msg("DoAllreduce-START", name));
 
   auto handle = handle_manager.AllocateHandle();
   auto device = GetDeviceID(tensor);
@@ -63,12 +117,14 @@ int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
   auto enqueue_result = EnqueueTensorAllreduce(
       hvd_context, hvd_tensor, hvd_output, ready_event,
       GetOpName("allreduce", name, handle), device,
-      [handle, average, output](const Status& status) mutable {
+      [handle, average, output, name](const Status& status) mutable {
         // Will execute in the `device` context.
         if (average) {
           output.div_(horovod_size());
         }
         handle_manager.MarkDone(handle, status);
+        std::string _msg = _fmt_msg("DoAllreduce-DONE", name);
+        _event_logger->info(_msg);
       });
   ThrowIfError(enqueue_result);
 
@@ -78,6 +134,8 @@ int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
 int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int average,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
+  check_logger();
+  spdlog::info("DoAllreduceCudaOnCPU, for the name {}!", name);
 
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
@@ -111,7 +169,7 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
 
 int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-
+  spdlog::info("DoAllgather, for the name {}!", name);
   auto device = GetDeviceID(tensor);
   auto ready_event = RecordReadyEvent(device);
   auto hvd_tensor = std::make_shared<TorchTensor>(tensor);
@@ -132,7 +190,7 @@ int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::strin
 int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-
+  spdlog::info("DoAllgatherCudaOnCPU, for the name {}!", name);
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
   auto cpu_tensor =
@@ -196,7 +254,7 @@ int DoBroadcast(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
 int DoBroadcastCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-
+  spdlog::info("DoBroadcastCudaOnCPU, for the name {}!", name);
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
   auto cpu_buffer =

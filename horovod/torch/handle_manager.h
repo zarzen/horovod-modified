@@ -21,7 +21,6 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "spdlog/spdlog.h"
 #include "../common/common.h"
 
 namespace horovod {

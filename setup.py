@@ -1338,7 +1338,7 @@ def build_cmake(build_ext, ext, prefix, additional_flags, options, plugin_ext=No
 
     cmake_build_args = [
         '--config', config,
-        '--', '-j4',
+        '--', '-j8',
     ]
 
     # Keep temp build files within a unique subdirectory

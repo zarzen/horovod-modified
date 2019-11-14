@@ -49,7 +49,7 @@ import time
 import json
 
 def _init_logging():
-    logdir = "~/horovod_logs"
+    logdir = "~/horovod_logs/hooks"
     logdir = os.path.expanduser(logdir)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
@@ -153,8 +153,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         # import pdb;pdb.set_trace()
         # print(type(pname), pname)
         # print(type(local_rank), local_rank)
-        lobj = {"ph": "X", "name": pname, "ts": time.time(), "pid": local_rank(), "dur": 1e-6}
-        self.logger.debug(json.dumps(lobj))
+        # lobj = {"ph": "X", "name": pname, "ts": time.time(), "pid": local_rank(), "dur": 1e-6}
+        # record the in microseconds.
+        self.logger.debug("{},{},{}".format("GradientCompute-DONE", pname, time.time()*1e6))
 
     def _make_hook(self, p):
         def hook(*ignore):

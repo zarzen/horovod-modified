@@ -28,7 +28,6 @@ int HandleManager::AllocateHandle() {
 void HandleManager::MarkDone(int handle, const Status& status) {
   std::lock_guard<std::mutex> guard(mutex_);
   results_[handle] = std::make_shared<Status>(status);
-  spdlog::info("MarkDone Hello, {}!", handle);
 }
 
 bool HandleManager::PollHandle(int handle) {
