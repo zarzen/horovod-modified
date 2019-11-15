@@ -55,7 +55,7 @@ def _init_logging():
         os.makedirs(logdir)
     dt = datetime.fromtimestamp(time.time())
     timestamp = dt.strftime("%Y%m%d-%H%M%S")
-    logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, local_rank()))
+    logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, rank()))
     print(logging_file)
     logging.basicConfig(level=logging.DEBUG, format='%(message)s')
     logger = logging.getLogger(__name__)
