@@ -135,7 +135,7 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
   check_logger();
-  spdlog::info("DoAllreduceCudaOnCPU, for the name {}!", name);
+  // spdlog::info("DoAllreduceCudaOnCPU, for the name {}!", name);
 
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
@@ -190,7 +190,7 @@ int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::strin
 int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-  spdlog::info("DoAllgatherCudaOnCPU, for the name {}!", name);
+  // spdlog::info("DoAllgatherCudaOnCPU, for the name {}!", name);
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
   auto cpu_tensor =

@@ -15,6 +15,7 @@
 // =============================================================================
 
 #include "nccl_operations.h"
+#include "spdlog/spdlog.h"
 
 namespace horovod {
 namespace common {
@@ -81,7 +82,7 @@ Status NCCLAllreduce::Execute(std::vector<TensorTableEntry>& entries,
   for (auto& e : entries) {
     num_elements += e.tensor->shape().num_elements();
   }
-
+  spdlog::info("NCCL Allreduce");
   // Do allreduce.
   auto nccl_result = ncclAllReduce(fused_input_data, buffer_data,
                                    (size_t) num_elements,
