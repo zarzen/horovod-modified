@@ -123,8 +123,7 @@ int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
           output.div_(horovod_size());
         }
         handle_manager.MarkDone(handle, status);
-        std::string _msg = _fmt_msg("DoAllreduce-DONE", name);
-        _event_logger->info(_msg);
+        _event_logger->info(_fmt_msg("DoAllreduce-DONE", name));
       });
   ThrowIfError(enqueue_result);
 
@@ -135,7 +134,7 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
   check_logger();
-  // spdlog::info("DoAllreduceCudaOnCPU, for the name {}!", name);
+  _event_logger->info(_fmt_msg("DoAllreduceCudaOnCPU-START", name));
 
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
@@ -152,7 +151,7 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
       hvd_context, hvd_cpu_buffer, hvd_cpu_buffer, ready_event,
       GetOpName("allreduce", name, handle), CPU_DEVICE_ID,
       [handle, average, cpu_buffer, output,
-       device](const Status& status) mutable {
+       device, name](const Status& status) mutable {
         // Since the operation was on CPU, need to perform copy with the GPU
         // device guard.
         with_device device_guard(device);
@@ -161,6 +160,7 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
           output.div_(horovod_size());
         }
         handle_manager.MarkDone(handle, status);
+        _event_logger->info(_fmt_msg("DoAllreduceCudaOnCPU-DONE", name));
       });
   ThrowIfError(enqueue_result);
 
@@ -169,7 +169,9 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
 
 int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-  spdlog::info("DoAllgather, for the name {}!", name);
+  check_logger();
+  _event_logger->info(_fmt_msg("DoAllgather-START", name));
+
   auto device = GetDeviceID(tensor);
   auto ready_event = RecordReadyEvent(device);
   auto hvd_tensor = std::make_shared<TorchTensor>(tensor);
@@ -179,8 +181,9 @@ int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::strin
   auto enqueue_result =
       EnqueueTensorAllgather(hvd_context, hvd_tensor, ready_event,
                              GetOpName("allgather", name, handle), device,
-                             [handle](const Status& status) {
+                             [handle, name](const Status& status) {
                                handle_manager.MarkDone(handle, status);
+                               _event_logger->info(_fmt_msg("DoAllgather-DONE", name));
                              });
   ThrowIfError(enqueue_result);
 
@@ -190,7 +193,8 @@ int DoAllgather(::torch::Tensor tensor, ::torch::Tensor output, const std::strin
 int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-  // spdlog::info("DoAllgatherCudaOnCPU, for the name {}!", name);
+  check_logger();
+  _event_logger->info(_fmt_msg("DoAllgatherCudaOnCPU-START", name));
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
   auto cpu_tensor =
@@ -207,7 +211,7 @@ int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
   auto enqueue_result = EnqueueTensorAllgather(
       hvd_context, hvd_cpu_tensor, ready_event,
       GetOpName("allgather", name, handle), CPU_DEVICE_ID,
-      [handle, cpu_output, output, device](const Status& status) mutable {
+      [handle, cpu_output, output, device, name](const Status& status) mutable {
         // Since the operation was on CPU, need to perform copy with the GPU
         // device guard.
         with_device device_guard(device);
@@ -215,6 +219,7 @@ int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
         output.resize_(cpu_output.sizes());
         output.copy_(cpu_output);
         handle_manager.MarkDone(handle, status);
+        _event_logger->info(_fmt_msg("DoAllgatherCudaOnCPU-DONE", name));
       });
   ThrowIfError(enqueue_result);
 
@@ -224,7 +229,8 @@ int DoAllgatherCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output,
 int DoBroadcast(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
                 const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-
+  check_logger();
+  _event_logger->info(_fmt_msg("DoBroadcast-START", name));
   auto device = GetDeviceID(tensor);
   auto ready_event = RecordReadyEvent(device);
   auto hvd_tensor = std::make_shared<TorchTensor>(tensor);
@@ -243,8 +249,9 @@ int DoBroadcast(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
   auto enqueue_result =
       EnqueueTensorBroadcast(hvd_context, hvd_tensor, hvd_output, root_rank,
                              ready_event, GetOpName("broadcast", name, handle),
-                             device, [handle](const Status& status) {
+                             device, [handle, name](const Status& status) {
                                handle_manager.MarkDone(handle, status);
+                               _event_logger->info(_fmt_msg("DoBroadcast-DONE", name));
                              });
   ThrowIfError(enqueue_result);
 
@@ -254,7 +261,8 @@ int DoBroadcast(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
 int DoBroadcastCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int root_rank,
                          const std::string& name) {
   ThrowIfError(common::CheckInitialized());
-  spdlog::info("DoBroadcastCudaOnCPU, for the name {}!", name);
+  check_logger();
+  _event_logger->info(_fmt_msg("DoBroadcastCudaOnCPU-START", name));
   // Make async copy of input tensor to CPU tensor and record completion event.
   auto device = GetDeviceID(tensor);
   auto cpu_buffer =
@@ -269,12 +277,13 @@ int DoBroadcastCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int roo
   auto enqueue_result = EnqueueTensorBroadcast(
       hvd_context, hvd_cpu_buffer, hvd_cpu_buffer, root_rank, ready_event,
       GetOpName("broadcast", name, handle), CPU_DEVICE_ID,
-      [handle, cpu_buffer, output, device](const Status& status) mutable {
+      [handle, cpu_buffer, output, device, name](const Status& status) mutable {
         // Since the operation was on CPU, need to perform copy with the GPU
         // device guard.
         with_device device_guard(device);
         output.copy_(cpu_buffer);
         handle_manager.MarkDone(handle, status);
+        _event_logger->info(_fmt_msg("DoBroadcastCudaOnCPU-START", name));
       });
   ThrowIfError(enqueue_result);
 
