@@ -57,7 +57,7 @@ def _init_logging():
     timestamp = dt.strftime("%Y%m%d-%H%M%S")
     logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, rank()))
     print(logging_file)
-    logging.basicConfig(level=logging.DEBUG, format='%(message)s')
+    # logging.basicConfig(level=logging.DEBUG, format='%(message)s')
     logger = logging.getLogger(__name__)
     f_handler = logging.FileHandler(logging_file, mode='w')
     f_handler.setLevel(logging.DEBUG)
