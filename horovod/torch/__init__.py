@@ -49,6 +49,15 @@ import time
 import json
 
 def _init_logging():
+    class MyLogger:
+        def __init__(self, logpath):
+            self.log_file = open(logpath, 'w+')
+        def debug(self, msg):
+            self.log_file.write(msg + '\n')
+            # self.log_file.wrtie("\n")
+        def __del__(self):
+            self.log_file.close()
+
     logdir = "~/horovod_logs/hooks"
     logdir = os.path.expanduser(logdir)
     if not os.path.exists(logdir):
@@ -57,13 +66,7 @@ def _init_logging():
     timestamp = dt.strftime("%Y%m%d-%H%M%S")
     logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, rank()))
     print(logging_file)
-    # logging.basicConfig(level=logging.DEBUG, format='%(message)s')
-    logger = logging.getLogger(__name__)
-    f_handler = logging.FileHandler(logging_file, mode='w')
-    f_handler.setLevel(logging.DEBUG)
-    f_format = logging.Formatter('%(message)s')
-    f_handler.setFormatter(f_format)
-    logger.addHandler(f_handler)
+    logger = MyLogger(logging_file)
     return logger
 
 class _DistributedOptimizer(torch.optim.Optimizer):
