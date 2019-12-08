@@ -41,7 +41,7 @@ std::string _current_time_and_date() {
   auto in_time_t = std::chrono::system_clock::to_time_t(now);
 
   std::stringstream ss;
-  ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d.%H:%M:%S");
+  ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d-%H%M%S");
   return ss.str();
 }
 
@@ -52,9 +52,10 @@ std::string _get_logpath() {
   bool _flag = mkdir(_log_dir.c_str(), 0777);
   std::cout << "create dir: " << _log_dir << ", status: " << _flag << "\n";
   static std::string _logfile = _log_dir
-    + _timestamp 
-    + "-rank-" + std::to_string(horovod_rank())
+    + "mpi-" +  _timestamp 
+    + "-rank" + std::to_string(horovod_rank())
     + ".log";
+  std::cout << "logfile" << _logfile << "\n";
   return _logfile;
 }
 

@@ -46,7 +46,6 @@ import logging
 import os
 from datetime import datetime
 import time
-import json
 
 def _init_logging():
     class MyLogger:
@@ -64,7 +63,7 @@ def _init_logging():
         os.makedirs(logdir)
     dt = datetime.fromtimestamp(time.time())
     timestamp = dt.strftime("%Y%m%d-%H%M%S")
-    logging_file = os.path.join(logdir, "{}-rank{}.log".format(timestamp, rank()))
+    logging_file = os.path.join(logdir, "hook-{}-rank{}.log".format(timestamp, rank()))
     print(logging_file)
     logger = MyLogger(logging_file)
     return logger
